@@ -1,2 +1,14 @@
 ---
-# tasks file for simplesnap-server
+
+- name: copy simplesnap scripts
+  copy:
+    src: "{{ item }}"
+    dest: /usr/local/bin/
+    owner: root
+    group: root
+    mode: "a+x"
+  with_items:
+    - simplesnap
+    - simplesnapwrap
+
+

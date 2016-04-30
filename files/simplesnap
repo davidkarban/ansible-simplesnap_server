@@ -1,0 +1,323 @@
+#!/bin/bash
+
+# Simple snapshot manager
+
+# Copyright (c) 2014 John Goerzen
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+set -e
+
+# Log a message
+logit () {
+   logger -p info -t "`basename $0`[$$]" "$1"
+}
+
+# Log stdin with the given code.  Used normally to log stderr.
+logstdin () {
+   logger -p info -t "`basename $0`[$$/$1]"
+}
+
+# Run command, logging stderr and exit code
+runcommand () {
+   logit "Running $*"
+   if "$@" 2> >(logstdin "$1") ; then
+      logit "$1 exited successfully"
+      return 0
+   else
+       RETVAL="$?"
+       logit "$1 exited with error $RETVAL"
+       return "$RETVAL"
+   fi
+}
+
+
+exiterror () {
+   logit "$1"
+   echo "$1" 1>&2
+   exit 10
+}
+
+syntaxerror () {
+   cat <<EOF
+Syntax: 
+
+$0 [--sshcmd CMD] [--local] [--wrapcmd CMD] 
+   [--backupdataset DATASET [--datasetdest DEST]] 
+   --store STORE --setname NAME --host HOST
+
+or
+
+$0 --check TIMEFRAME --store STORE --setname NAME [--host HOST]
+
+Required:
+
+  --store: gives the ZFS dataset name where data will be stored.  Mountpoint
+           is inferred.
+  --setname: Gives the backup set name.  Can just be a made-up word
+             if multiple sets aren not needed; for instance, the hostname
+             of the backup server.  This is used in the snapshot name.
+  --host: Gives the hostname to back up.
+
+Optional:
+
+  --sshcmd: Gives the SSH command.  Defaults to "ssh".  Example:
+            --sshcmd "ssh -i /root/.id_rsa_simplesnap"
+  --wrapcmd: Gives the path to simplesnapwrap on the remote
+             (or local machine, if --local is present).
+             Not usually relevant, since this is set in
+             ~/.ssh/authorized_keys.  Default: "simplesnapwrap"
+  --local: The host is localhost; do not use remote tool to access it.
+  --backupdataset: Back up only the specified dataset instead of all.
+  --datasetdest: Valid only with --backupdataset; store the backup in
+                 the specified location.
+  --check: Do not back up, but check existing backups.  If any are
+           older than TIMEFRAME, print an error and exit with a nonzero
+           code.  Scans all hosts unless a specific host is given with
+           --host.  The parameter is in the format given to date/gdate: 
+           for instance, --check "30 days ago".  Remember to enclose it
+           in quotes if it contains spaces.
+  
+EOF
+  exiterror "Syntax error: $1"
+}
+
+logit "Invoked as: $0 $*"
+
+while [ -n "$1" ]; do
+  case "$1" in
+    "--sshcmd")
+      SSHCMD="$2"
+      shift 2
+      ;;
+    "--wrapcmd")
+      WRAPCMD="$2"
+      shift 2
+      ;;
+    "--store")
+      STORE="$2"
+      shift 2
+      ;;
+    "--setname")
+      SETNAME="$2"
+      shift 2
+      ;;
+    "--host")
+      HOST="$2"
+      shift 2
+      ;;
+    "--backupdataset")
+      BACKUPDATASET="$2"
+      shift 2
+      ;;
+    "--datasetdest")
+      DATASETDEST="$2"
+      shift 2
+      ;;
+    "--check")
+      CHECKMODE="$2"
+      if [ -z "$CHECKMODE" ] ; then
+          syntaxerror "--check requires a paremter"
+      fi
+      shift 2
+      ;;
+    "--local")
+      LOCALMODE="on"
+      shift
+      ;;
+    *)
+      syntaxerror "Unknown option \"$1\""
+      ;;
+  esac
+done
+
+SSHCMD="${SSHCMD:-ssh}"
+WRAPCMD="${WRAPCMD:-simplesnapwrap}"
+
+DATE="gdate"
+gdate &> /dev/null || DATE="date"
+SED="gsed"
+gsed &> /dev/null || SED="sed"
+GREP="ggrep"
+ggrep &> /dev/null || GREP="grep"
+
+
+# Validating
+[ -n "$SSHCMD" ] || syntaxerror "Invalid SSH command: $SSHCMD"
+[ -n "$STORE" ] || syntaxerror "Missing --store"
+[ -n "$SETNAME" ] || syntaxerror "Missing --setname"
+[ -n "$CHECKMODE" -o -n "$HOST" ] || syntaxerror "Missing --host"
+
+echo "_${STORE}" | $GREP -qv " " || syntaxerror "Space in --store: ${STORE}"
+if [ -n "${DATASETDEST}" ]; then
+    echo "_${DATASETDEST}" | $GREP -qv " " || syntaxerror "Space in --datasetdest: ${DATASETDEST}"
+fi
+
+TEMPLATEPATTERN="^[a-zA-Z0-9]\+\$"
+echo "a${SETNAME}" | $GREP -q "${TEMPLATEPATTERN}" || syntaxerror "Invalid characters in setname \"${SETNAME}\"; pattern is \"${TEMPLATEPATTERN}\""
+echo "_${SETNAME}" | $GREP -qv '^_-' || syntaxerror "Set name cannot begin with a dash: \"${SETNAME}\""
+TEMPLATE="__simplesnap_${SETNAME}_"
+[ -n "$DATASETDEST" -a -z "$BACKUPDATASET" ] && syntaxerror "--datasetdest given without --backupdataset"
+
+MOUNTPOINT="`zfs list -H -o mountpoint -t filesystem \"${STORE}\"`"
+
+logit "Store ${STORE} is mounted at ${MOUNTPOINT}"
+
+cd "${MOUNTPOINT}"
+
+# template - $1
+# dataset - $2
+listsnaps () {
+   runzfs list -t snapshot -r -d 1 -H -o name "$2" | $GREP "@$1" || true
+}
+
+CHECKRETVAL=0
+
+runzfs () {
+  runcommand /sbin/zfs "$@"
+}
+
+checkbackups () {
+  CHECKHOST="$1"
+  DATASETS="`runzfs list -t filesystem,volume -o name -H -r \"${STORE}/${HOST}\"`"
+  CUTOFF="`$DATE -d \"${CHECKMODE}\" +%s`"
+  for CHECKDS in ${DATASETS}; do
+    # Don't check the top-level host dataset itself.
+    if [ "${CHECKDS}" = "${STORE}/${HOST}" ]; then
+        continue
+    fi
+
+    FOUNDOK=0
+    # Extract timestamps
+    for TIMESTAMP in `listsnaps "$TEMPLATE" "$CHECKDS" | $SED 's/^.*_\([^_]\+\)__$/\1/'`; do
+        TSSEC=`$DATE -d "${TIMESTAMP}" +%s`
+        if [ "$TSSEC" -gt "$CUTOFF" ]; 
+            then FOUNDOK=1
+        fi
+    done
+    if [ "$FOUNDOK" = "0" ]; then
+        echo "${CHECKDS} last back up is too old; created at `$DATE -d \"@${TSSEC}\"` but cutoff is `$DATE -d \"@${CUTOFF}\"`!" 1>&2
+        CHECKRETVAL=10
+    fi
+  done 
+}
+
+if [ -n "$CHECKMODE" ]; then
+  # Do a check only.
+  if [ -n "$HOST" ]; then
+    checkbackups "$HOST"
+  else
+    for HOST in *; do checkbackups "$HOST"; done
+  fi
+  logit "check: exiting with value $CHECKRETVAL"
+  exit $CHECKRETVAL
+fi
+
+runwrap () {
+  if [ "$LOCALMODE" = "on" ]; then
+    runcommand "${WRAPCMD}" reinvoked simplesnapwrap "$@"
+  else
+    runcommand ${SSHCMD} ${HOST} ${WRAPCMD} "$@"
+  fi
+}
+
+if [ ! -d "${MOUNTPOINT}/${HOST}" ]; then
+  runzfs create "${STORE}/${HOST}"
+fi
+
+LOCKFILE="${MOUNTPOINT}/${HOST}/.lock"
+
+if dotlockfile -r 0 -l -p "${LOCKFILE}"; then
+  LOCKMETHOD="dotlockfile"
+  logit "Lock obtained at ${LOCKFILE} with dotlockfile"
+  trap "ECODE=$?; dotlockfile -u \"${LOCKFILE}\"; exit $ECODE" EXIT INT TERM
+else
+  RETVAL="$?"
+  if [ "$RETVAL" = "127" ]; then
+    LOCKMETHOD="mkdir"
+    mkdir "${LOCKFILE}" || exiterror "Could not obtain lock at ${LOCKFILE}; if $0 is not already running, rmdir that path."
+    logit "Lock obtained at ${LOCKFILE} with mkdir"
+    trap "ECODE=$?; rmdir \"${LOCKFILE}\"" EXIT INT TERM
+  else
+    exiterror "Could not obtain lock at ${LOCKFILE}; $0 likely already running."
+  fi
+fi
+
+
+reap () {
+  DATASET="$1"
+       # We always save the most recent.
+       SNAPSTOREMOVE="`listsnaps \"${TEMPLATE}\" \"${DATASET}\" | head -n -1`"
+       if [ -z "${SNAPSTOREMOVE}" ]; then
+         logit "No snapshots to remove."
+       else
+         for REMOVAL in ${SNAPSTOREMOVE}; do
+            logit "Destroying snapshot ${REMOVAL}"
+            echo "_${REMOVAL}" | $GREP -q '@' || exiterror "PANIC: snapshot name doesn not contain @"
+            runzfs destroy "${REMOVAL}"
+         done
+       fi
+}
+  
+
+backupto() {
+    DATASET="$1"
+    DESTDIR="$2"
+    DATASETPATTERN="^[a-zA-Z0-9_/.-]\+\$"
+
+    if echo "a$DATASET" | $GREP -vq "$DATASETPATTERN"; then
+        logit "Dataset \"$DATASET\" contains invalid characters; pattern is $DATASETPATTERN"
+        return
+    fi
+
+    if echo "a$DATASET" | $GREP -q "^[/-]"; then
+        exiterror "Dataset \"$DATASET\" begins with a / or a -; something is wrong.  Aborting."
+    fi
+
+    if echo "a$DATASET" | $GREP -q '\.\.'; then
+        exiterror "Dataset \"$DATASET\" contains ..; something is wrong.  Aborting."
+    fi
+
+    if runwrap sendback "${SETNAME}" "${DATASET}" | \
+       runzfs receive -F "${DESTDIR}"; then
+
+        logit "Received backup into ${DESTDIR}"
+        runwrap reap "${SETNAME}" "${DATASET}"
+        reap "${DESTDIR}"
+    else
+        logit "zfs receive died with error: $?"
+        exit 100
+    fi        
+}
+
+# If the user requested only one dataset to be backed up:
+if [ -n "${BACKUPDATASET}" ]; then
+    logit "Option --backupdataset ${BACKUPDATASET} requested; not asking remote for dataset list."
+
+    # If the user gave a specified location:
+    if [ -n "${DATASETDEST}" ]; then
+        backupto "${BACKUPDATASET}" "${DATASETDEST}"
+    else
+        backupto "${BACKUPDATASET}" "${STORE}/${HOST}/${BACKUPDATASET}"
+    fi
+else
+    logit "Finding remote datasets to back up"
+
+    REMOTEDATASETS="`runwrap listfs`"
+    for DATASET in ${REMOTEDATASETS}; do
+        backupto "${DATASET}" "${STORE}/${HOST}/${DATASET}"
+    done
+fi
+
+logit "Exiting successfully."
+
