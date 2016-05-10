@@ -20,15 +20,15 @@
 
 - name: Create cron task for polling backups
   cron:
-    minute: "{{ item.minute|default('23') }}"
-    hour: "{{ item.hour|default('01') }}"
-    day: "{{ item.day|default('*') }}"
-    month: "{{ item.month|default('*') }}"
-    dow: "{{ item.dow|default('*') }}"
-    user: "{{ item.user|default(user) }}"
-    name: "{{ item.cron_file|default(cron_file) }}"
-    cron_file: "{{ item.cron_file|default(cron_file) }}"
-    job: "/usr/local/sbin/simplesnap {{ item.remotehost }} --setname {{ item.setname|default('mainset') }} --store {{ item.store|default('tank/backup') }}"
+    minute: "{{ item.simplesnap_minute|default('23') }}"
+    hour: "{{ item.simplesnap_hour|default('01') }}"
+    day: "{{ item.simplesnap_day|default('*') }}"
+    month: "{{ item.simplesnap_month|default('*') }}"
+    dow: "{{ item.simplesnap_dow|default('*') }}"
+    user: "{{ item.simplesnap_user|default(user) }}"
+    name: "{{ item.simplesnap_cron_file|default(cron_file) }}"
+    cron_file: "{{ item.simplesnap_cron_file|default(cron_file) }}"
+    job: "/usr/local/sbin/simplesnap {{ item.simplesnap_remotehost }} --setname {{ item.simplesnap_setname|default('mainset') }} --store {{ item.simplesnap_store|default('tank/backup') }}"
     backup: yes
     state: present
   with_items: "{{ simplesnap_jobs }}"
